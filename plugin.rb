@@ -1,6 +1,6 @@
 # name: digest-report
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel
-# version: 1.1
+# version: 1.2
 # authors: you
 
 after_initialize do
@@ -238,35 +238,112 @@ after_initialize do
     rescue StandardError
       ""
     end
+
+    # Extract first recipient email safely
+    def self.first_recipient_email(message)
+      begin
+        raw = Array(message&.to).first.to_s.strip
+        return "" if raw.empty?
+        begin
+          addr = Mail::Address.new(raw)
+          return addr.address.to_s.strip
+        rescue StandardError
+          m = raw.match(/([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})/i)
+          return m ? m[1].to_s.strip : raw
+        end
+      rescue StandardError
+        ""
+      end
+    end
+
+    # Inject tracking pixel into a Mail::Message (multipart or not).
+    # Returns true if injection succeeded.
+    def self.inject_pixel_into_mail!(mail_message, email_id:, user_id:, user_email:)
+      return false if mail_message.nil?
+
+      pixel = build_tracking_pixel_html(email_id: email_id, user_id: user_id, user_email: user_email)
+      return false if pixel.to_s.empty?
+
+      # multipart -> html_part
+      begin
+        if mail_message.respond_to?(:multipart?) && mail_message.multipart?
+          hp = mail_message.html_part rescue nil
+          if hp && hp.body
+            html = hp.body.decoded.to_s rescue ""
+            return false if html.to_s.empty?
+
+            new_html =
+              if html.include?("</body>")
+                html.sub("</body>", "#{pixel}</body>")
+              else
+                html + pixel
+              end
+
+            hp.body = new_html rescue nil
+            return true
+          end
+        end
+      rescue StandardError
+        # continue to non-multipart attempt
+      end
+
+      # non-multipart HTML
+      begin
+        ct = mail_message.content_type.to_s rescue ""
+        if ct.downcase.include?("text/html")
+          html = mail_message.body.decoded.to_s rescue ""
+          return false if html.to_s.empty?
+
+          new_html =
+            if html.include?("</body>")
+              html.sub("</body>", "#{pixel}</body>")
+            else
+              html + pixel
+            end
+
+          mail_message.body = new_html rescue nil
+          return true
+        end
+      rescue StandardError
+      end
+
+      false
+    rescue StandardError
+      false
+    end
+
+    def self.set_digest_report_headers!(mail_message, email_id:, open_tracking_used:, user_id:)
+      return false if mail_message.nil?
+      begin
+        mail_message.header["X-Digest-Report-Email-Id"] = email_id.to_s
+        mail_message.header["X-Digest-Report-Open-Tracking-Used"] = open_tracking_used.to_s
+        mail_message.header["X-Digest-Report-User-Id"] = user_id.to_s
+        true
+      rescue StandardError
+        false
+      end
+    end
   end
 
   # =========================
-  # Inject tracking pixel BEFORE send (digest only)
+  # Build-level patch: inject pixel + stamp headers (digest only)
   # =========================
   module ::DigestReportEmailBuilderPatch
-    def html_part
-      part = super
-      begin
-        return part unless ::DigestReport.enabled?
-        return part unless ::DigestReport.open_tracking_enabled?
+    def build(*args)
+      msg = super
 
-        # Only digests
+      begin
+        return msg unless ::DigestReport.enabled?
+
         typ = ""
         begin
           typ = (@opts && @opts[:type]).to_s
         rescue StandardError
           typ = ""
         end
-        return part unless typ == "digest"
+        return msg unless typ == "digest"
 
-        # Identify recipient + user
-        user_email = ""
-        begin
-          user_email = @to.to_s.strip
-        rescue StandardError
-          user_email = ""
-        end
-
+        # Identify user
         user = nil
         begin
           user = @opts[:user] if @opts.is_a?(Hash)
@@ -281,50 +358,50 @@ after_initialize do
             user = nil
           end
         end
-        return part if user.nil? # can't store / can't do per-user
+        return msg if user.nil?
 
-        # Generate email_id ONCE per message build
-        @digest_report_email_id ||= ::DigestReport.random_20_digit_id
-
-        # Store last email_id per user (server-side "bubble")
-        ::DigestReport.store_last_email_id_for_user(user.id, @digest_report_email_id)
-
-        # Only if HTML exists
-        html = ""
+        # Recipient email (best-effort) from builder
+        user_email = ""
         begin
-          html = part&.body&.decoded.to_s
+          user_email = @to.to_s.strip
         rescue StandardError
-          html = ""
+          user_email = ""
         end
-        return part if html.to_s.empty?
 
-        pixel = ::DigestReport.build_tracking_pixel_html(
-          email_id: @digest_report_email_id,
-          user_id: user.id,
-          user_email: user_email
+        # Generate ONE email_id per built message
+        email_id = (@digest_report_email_id ||= ::DigestReport.random_20_digit_id)
+
+        # Store per-user (optional, still useful)
+        ::DigestReport.store_last_email_id_for_user(user.id, email_id)
+
+        injected = false
+        if ::DigestReport.open_tracking_enabled?
+          injected = ::DigestReport.inject_pixel_into_mail!(
+            msg,
+            email_id: email_id,
+            user_id: user.id,
+            user_email: user_email
+          )
+        end
+
+        open_tracking_used = injected ? "1" : "0"
+        ::DigestReport.set_digest_report_headers!(
+          msg,
+          email_id: email_id,
+          open_tracking_used: open_tracking_used,
+          user_id: user.id
         )
-        return part if pixel.to_s.empty?
 
-        # Inject before </body> if present, else append
-        new_html =
-          if html.include?("</body>")
-            html.sub("</body>", "#{pixel}</body>")
-          else
-            html + pixel
-          end
-
-        begin
-          part.body = new_html
-        rescue StandardError
-          return part
+        if injected
+          ::DigestReport.log("OpenTracking injected+stamped email_id=#{email_id} user_id=#{user.id}")
+        else
+          ::DigestReport.log("OpenTracking NOT injected (still stamped) email_id=#{email_id} user_id=#{user.id}")
         end
-
-        ::DigestReport.log("OpenTracking injected email_id=#{@digest_report_email_id} user_id=#{user.id}")
-        part
       rescue StandardError => e
-        ::DigestReport.log_error("OpenTracking inject error err=#{e.class}: #{e.message}")
-        part
+        ::DigestReport.log_error("Build patch error err=#{e.class}: #{e.message}")
       end
+
+      msg
     end
   end
 
@@ -451,19 +528,14 @@ after_initialize do
   end
 
   # =========================
-  # After email send: enqueue postback (uses stored email_id if open-tracking path was used)
+  # After email send: enqueue postback (prefers stamped headers; fallback to PluginStore)
   # =========================
   DiscourseEvent.on(:after_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
       next unless email_type.to_s == "digest"
 
-      recipient =
-        begin
-          Array(message&.to).first.to_s.strip
-        rescue StandardError
-          ""
-        end
+      recipient = ::DigestReport.first_recipient_email(message)
 
       subject =
         begin
@@ -492,15 +564,42 @@ after_initialize do
 
       topic_ids = ::DigestReport.extract_topic_ids_from_message(message)
 
-      # Use pre-send stored id if open tracking was actually used
+      # Prefer build-time stamped headers (most reliable)
       email_id = ""
       open_tracking_used = "0"
 
-      if ::DigestReport.open_tracking_enabled? && user
-        stored = ::DigestReport.get_last_email_id_for_user(user.id)
-        if !stored.to_s.strip.empty?
-          email_id = stored
-          open_tracking_used = "1"
+      begin
+        h_email_id = message&.header&.[]("X-Digest-Report-Email-Id")&.to_s.to_s.strip rescue ""
+        h_open     = message&.header&.[]("X-Digest-Report-Open-Tracking-Used")&.to_s.to_s.strip rescue ""
+        h_user_id  = message&.header&.[]("X-Digest-Report-User-Id")&.to_s.to_s.strip rescue ""
+
+        email_id = h_email_id unless h_email_id.empty?
+        open_tracking_used = (h_open == "1" ? "1" : "0")
+
+        # If user lookup failed earlier, try by stamped user id
+        if user.nil? && !h_user_id.empty?
+          begin
+            uid = h_user_id.to_i
+            user = User.find_by(id: uid) if uid > 0
+          rescue StandardError
+            user = nil
+          end
+          user_id = user ? user.id : user_id
+          username = user ? user.username.to_s : username
+          user_created_at_utc = user ? ::DigestReport.safe_iso8601(user.created_at) : user_created_at_utc
+        end
+      rescue StandardError
+        # ignore, fall back below
+      end
+
+      # Fallback: PluginStore (older behavior)
+      if email_id.to_s.strip.empty?
+        if ::DigestReport.open_tracking_enabled? && user
+          stored = ::DigestReport.get_last_email_id_for_user(user.id)
+          if !stored.to_s.strip.empty?
+            email_id = stored
+            open_tracking_used = "1"
+          end
         end
       end
 
