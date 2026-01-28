@@ -1,4 +1,4 @@
-# name: digest-postback
+# name: digest-report
 # about: POST to external endpoint after digest email is sent (failsafe, async)
 # version: 0.2
 # authors: you
