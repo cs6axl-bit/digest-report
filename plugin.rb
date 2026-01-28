@@ -8,7 +8,7 @@ after_initialize do
   require "uri"
 
   module ::DigestPostback
-    PLUGIN_NAME = "digest-postback"
+    PLUGIN_NAME = "digest-report"
 
     # =========================
     # HARD-CODED SETTINGS (edit here)
