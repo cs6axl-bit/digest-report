@@ -20,11 +20,11 @@ after_initialize do
 
     # Timeouts (keep short so jobs can't hang workers too long)
     OPEN_TIMEOUT_SECONDS  = 3
-    READ_TIMEOUT_SECONDS  = 5
-    WRITE_TIMEOUT_SECONDS = 5
+    READ_TIMEOUT_SECONDS  = 3
+    WRITE_TIMEOUT_SECONDS = 3
 
     # Sidekiq retry count (small, so failures don't pile up)
-    JOB_RETRY_COUNT = 3
+    JOB_RETRY_COUNT = 2
     # =========================
 
     def self.log(msg)
