@@ -1,6 +1,6 @@
 # name: digest-report
 # about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs
-# version: 1.3
+# version: 1.4
 # authors: you
 
 after_initialize do
@@ -28,7 +28,6 @@ after_initialize do
     OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
 
     # ===== DEBUG LOGGING =====
-    # When true: writes lots of "DEBUG ..." lines to Rails logs to show WHY injection did/didn't happen
     DEBUG_LOG = true
 
     # POST field names
@@ -84,14 +83,12 @@ after_initialize do
       return unless DEBUG_LOG
       log("DEBUG #{msg}")
     rescue StandardError
-      # swallow
     end
 
     def self.dlog_error(msg)
       return unless DEBUG_LOG
       log_error("DEBUG #{msg}")
     rescue StandardError
-      # swallow
     end
 
     def self.enabled?
@@ -153,6 +150,27 @@ after_initialize do
       v.to_s.strip
     rescue StandardError
       ""
+    end
+
+    def self.header_val(message, key)
+      begin
+        v = message&.header&.[](key)
+        v.to_s.strip
+      rescue StandardError
+        ""
+      end
+    end
+
+    def self.set_digest_report_headers!(mail_message, email_id:, open_tracking_used:, user_id:)
+      return false if mail_message.nil?
+      begin
+        mail_message.header["X-Digest-Report-Email-Id"] = email_id.to_s
+        mail_message.header["X-Digest-Report-Open-Tracking-Used"] = open_tracking_used.to_s
+        mail_message.header["X-Digest-Report-User-Id"] = user_id.to_s
+        true
+      rescue StandardError
+        false
+      end
     end
 
     def self.extract_email_body(message)
@@ -230,6 +248,23 @@ after_initialize do
       []
     end
 
+    # Extract first recipient email safely
+    def self.first_recipient_email(message)
+      begin
+        raw = Array(message&.to).first.to_s.strip
+        return "" if raw.empty?
+        begin
+          addr = Mail::Address.new(raw)
+          return addr.address.to_s.strip
+        rescue StandardError
+          m = raw.match(/([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})/i)
+          return m ? m[1].to_s.strip : raw
+        end
+      rescue StandardError
+        ""
+      end
+    end
+
     # Build tracking pixel HTML (safe, tiny, hidden)
     def self.build_tracking_pixel_html(email_id:, user_id:, user_email:)
       base = OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip
@@ -257,30 +292,12 @@ after_initialize do
       ""
     end
 
-    # Extract first recipient email safely
-    def self.first_recipient_email(message)
-      begin
-        raw = Array(message&.to).first.to_s.strip
-        return "" if raw.empty?
-        begin
-          addr = Mail::Address.new(raw)
-          return addr.address.to_s.strip
-        rescue StandardError
-          m = raw.match(/([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})/i)
-          return m ? m[1].to_s.strip : raw
-        end
-      rescue StandardError
-        ""
-      end
-    end
-
-    def self.header_val(message, key)
-      begin
-        v = message&.header&.[](key)
-        return v.to_s.strip
-      rescue StandardError
-        ""
-      end
+    def self.message_already_has_pixel?(mail_message)
+      b = extract_email_body(mail_message)
+      return false if b.to_s.empty?
+      b.include?(OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip)
+    rescue StandardError
+      false
     end
 
     # Inject tracking pixel into a Mail::Message (multipart or not).
@@ -355,116 +372,67 @@ after_initialize do
       dlog_error("inject: crash err=#{e.class}: #{e.message}")
       false
     end
+  end
 
-    def self.set_digest_report_headers!(mail_message, email_id:, open_tracking_used:, user_id:)
-      return false if mail_message.nil?
+  # =========================
+  # BEFORE send: inject pixel + stamp headers (digest only)  ✅ reliable
+  # =========================
+  DiscourseEvent.on(:before_email_send) do |message, email_type|
+    begin
+      next unless ::DigestReport.enabled?
+      next unless email_type.to_s == "digest"
+
+      # If already stamped, do nothing (prevents double runs)
+      existing_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
+      if !existing_id.empty?
+        ::DigestReport.dlog("before_email_send: already stamped email_id=#{existing_id} -> skip")
+        next
+      end
+
+      recipient = ::DigestReport.first_recipient_email(message)
+      user = nil
       begin
-        mail_message.header["X-Digest-Report-Email-Id"] = email_id.to_s
-        mail_message.header["X-Digest-Report-Open-Tracking-Used"] = open_tracking_used.to_s
-        mail_message.header["X-Digest-Report-User-Id"] = user_id.to_s
-        true
+        user = User.find_by_email(recipient) unless recipient.empty?
       rescue StandardError
-        false
-      end
-    end
-  end
-
-  # =========================
-  # Build-level patch: inject pixel + stamp headers (digest only)
-  # =========================
-  module ::DigestReportEmailBuilderPatch
-    def build(*args)
-      msg = super
-
-      begin
-        unless ::DigestReport.enabled?
-          ::DigestReport.dlog("build: disabled -> return")
-          return msg
-        end
-
-        typ = ""
-        begin
-          typ = (@opts && @opts[:type]).to_s
-        rescue StandardError
-          typ = ""
-        end
-
-        if typ != "digest"
-          ::DigestReport.dlog("build: not digest typ=#{typ.inspect} -> return")
-          return msg
-        end
-
-        # Identify user
         user = nil
-        begin
-          user = @opts[:user] if @opts.is_a?(Hash)
-        rescue StandardError
-          user = nil
-        end
-        if user.nil?
-          begin
-            uid = (@opts && @opts[:user_id]).to_i
-            user = User.find_by(id: uid) if uid > 0
-          rescue StandardError
-            user = nil
-          end
-        end
+      end
+      uid = user ? user.id : 0
 
-        if user.nil?
-          ::DigestReport.dlog("build: digest but user=nil -> return")
-          return msg
-        end
+      email_id = ::DigestReport.random_20_digit_id
 
-        # Recipient email (best-effort) from builder
-        user_email = ""
-        begin
-          user_email = @to.to_s.strip
-        rescue StandardError
-          user_email = ""
-        end
-
-        # Generate ONE email_id per built message
-        email_id = (@digest_report_email_id ||= ::DigestReport.random_20_digit_id)
-
-        # Store per-user (optional, still useful)
-        ::DigestReport.store_last_email_id_for_user(user.id, email_id)
-
-        injected = false
-        if ::DigestReport.open_tracking_enabled?
-          injected = ::DigestReport.inject_pixel_into_mail!(
-            msg,
-            email_id: email_id,
-            user_id: user.id,
-            user_email: user_email
-          )
+      injected = false
+      if ::DigestReport.open_tracking_enabled?
+        if ::DigestReport.message_already_has_pixel?(message)
+          ::DigestReport.dlog("before_email_send: pixel already present -> injected=false (skip)")
+          injected = true # treat as used
         else
-          ::DigestReport.dlog("build: open_tracking_enabled?=false")
+          injected = ::DigestReport.inject_pixel_into_mail!(
+            message,
+            email_id: email_id,
+            user_id: uid,
+            user_email: recipient
+          )
         end
-
-        open_tracking_used = injected ? "1" : "0"
-        ::DigestReport.set_digest_report_headers!(
-          msg,
-          email_id: email_id,
-          open_tracking_used: open_tracking_used,
-          user_id: user.id
-        )
-
-        ::DigestReport.dlog(
-          "build: typ=digest user_id=#{user.id} to=#{user_email.inspect} content_type=#{(msg.content_type.to_s rescue '').inspect} " \
-          "multipart=#{(msg.multipart? rescue 'n/a')} injected=#{injected} email_id=#{email_id}"
-        )
-      rescue StandardError => e
-        ::DigestReport.dlog_error("build patch error err=#{e.class}: #{e.message}")
       end
 
-      msg
-    end
-  end
+      open_used = injected ? "1" : "0"
 
-  begin
-    Email::MessageBuilder.prepend(::DigestReportEmailBuilderPatch)
-  rescue StandardError => e
-    ::DigestReport.log_error("Failed to prepend EmailBuilderPatch err=#{e.class}: #{e.message}")
+      ::DigestReport.set_digest_report_headers!(
+        message,
+        email_id: email_id,
+        open_tracking_used: open_used,
+        user_id: uid
+      )
+
+      ::DigestReport.store_last_email_id_for_user(uid, email_id) if uid > 0
+
+      ::DigestReport.dlog(
+        "before_email_send: digest to=#{recipient.inspect} user_id=#{uid} injected=#{injected} open_used=#{open_used} email_id=#{email_id} " \
+        "content_type=#{(message.content_type.to_s rescue '').inspect} multipart=#{(message.multipart? rescue 'n/a')}"
+      )
+    rescue StandardError => e
+      ::DigestReport.dlog_error("before_email_send error err=#{e.class}: #{e.message}")
+    end
   end
 
   # =========================
@@ -497,7 +465,6 @@ after_initialize do
         username = ::DigestReport.safe_str(args[:username], ::DigestReport::USERNAME_MAX_LEN)
         user_created_at_utc = args[:user_created_at_utc].to_s
 
-        # topic IDs in email order (dedupe while keeping order)
         incoming_ids = Array(args[:topic_ids]).map { |x| x.to_i }
         seen = {}
         topic_ids_ordered = []
@@ -574,7 +541,6 @@ after_initialize do
           begin
             http.finish if http.started?
           rescue StandardError
-            # swallow
           end
         end
       rescue StandardError => e
@@ -584,21 +550,15 @@ after_initialize do
   end
 
   # =========================
-  # After email send: enqueue postback (prefers stamped headers; fallback to PluginStore)
+  # After email send: enqueue postback (uses stamped headers)
   # =========================
   DiscourseEvent.on(:after_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
       next unless email_type.to_s == "digest"
 
-      ::DigestReport.dlog(
-        "after_email_send: email_type=#{email_type.inspect} to=#{Array(message&.to).first.to_s.inspect} subject=#{message&.subject.to_s[0, 80].inspect}"
-      )
-      ::DigestReport.dlog(
-        "after_email_send: hdr email_id=#{::DigestReport.header_val(message, 'X-Digest-Report-Email-Id').inspect} " \
-        "open=#{::DigestReport.header_val(message, 'X-Digest-Report-Open-Tracking-Used').inspect} " \
-        "user_id=#{::DigestReport.header_val(message, 'X-Digest-Report-User-Id').inspect}"
-      )
+      ::DigestReport.dlog("after_email_send: email_type=#{email_type.inspect} to=#{Array(message&.to).first.to_s.inspect} subject=#{message&.subject.to_s[0, 80].inspect}")
+      ::DigestReport.dlog("after_email_send: hdr email_id=#{::DigestReport.header_val(message,'X-Digest-Report-Email-Id').inspect} open=#{::DigestReport.header_val(message,'X-Digest-Report-Open-Tracking-Used').inspect} user_id=#{::DigestReport.header_val(message,'X-Digest-Report-User-Id').inspect}")
 
       recipient = ::DigestReport.first_recipient_email(message)
 
@@ -629,45 +589,11 @@ after_initialize do
 
       topic_ids = ::DigestReport.extract_topic_ids_from_message(message)
 
-      # Prefer build-time stamped headers (most reliable)
-      email_id = ""
-      open_tracking_used = "0"
+      email_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
+      open_tracking_used = ::DigestReport.header_val(message, "X-Digest-Report-Open-Tracking-Used")
+      open_tracking_used = (open_tracking_used == "1" ? "1" : "0")
 
-      begin
-        h_email_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
-        h_open     = ::DigestReport.header_val(message, "X-Digest-Report-Open-Tracking-Used")
-        h_user_id  = ::DigestReport.header_val(message, "X-Digest-Report-User-Id")
-
-        email_id = h_email_id unless h_email_id.empty?
-        open_tracking_used = (h_open == "1" ? "1" : "0")
-
-        # If user lookup failed earlier, try by stamped user id
-        if user.nil? && !h_user_id.empty?
-          begin
-            uid = h_user_id.to_i
-            user = User.find_by(id: uid) if uid > 0
-          rescue StandardError
-            user = nil
-          end
-          user_id = user ? user.id : user_id
-          username = user ? user.username.to_s : username
-          user_created_at_utc = user ? ::DigestReport.safe_iso8601(user.created_at) : user_created_at_utc
-        end
-      rescue StandardError
-        # ignore, fall back below
-      end
-
-      # Fallback: PluginStore (older behavior)
-      if email_id.to_s.strip.empty?
-        if ::DigestReport.open_tracking_enabled? && user
-          stored = ::DigestReport.get_last_email_id_for_user(user.id)
-          if !stored.to_s.strip.empty?
-            email_id = stored
-            open_tracking_used = "1"
-          end
-        end
-      end
-
+      # hard fallback if something went wrong
       email_id = ::DigestReport.random_20_digit_id if email_id.to_s.strip.empty?
 
       Jobs.enqueue(
@@ -684,10 +610,7 @@ after_initialize do
       )
 
       first_topic_id = topic_ids[0] ? topic_ids[0].to_s : ""
-      ::DigestReport.log(
-        "Enqueued postback email_id=#{email_id} open_tracking_used=#{open_tracking_used} user_found=#{!user.nil?} " \
-        "topic_ids_count=#{topic_ids.length} first_topic_id=#{first_topic_id}"
-      )
+      ::DigestReport.log("Enqueued postback email_id=#{email_id} open_tracking_used=#{open_tracking_used} user_found=#{!user.nil?} topic_ids_count=#{topic_ids.length} first_topic_id=#{first_topic_id}")
     rescue StandardError => e
       ::DigestReport.log_error("ENQUEUE ERROR err=#{e.class}: #{e.message}")
     end
