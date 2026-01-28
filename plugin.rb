@@ -1,13 +1,13 @@
 # name: digest-report
 # about: POST to external endpoint after digest email is sent (failsafe, async)
-# version: 0.2
+# version: 0.3
 # authors: you
 
 after_initialize do
   require "net/http"
   require "uri"
 
-  module ::DigestPostback
+  module ::DigestReport
     PLUGIN_NAME = "digest-report"
 
     # =========================
@@ -15,8 +15,8 @@ after_initialize do
     # =========================
     ENABLED = true
 
-    ENDPOINT_URL = "https://ai.templetrends.com/digest_report.php" # <-- change
-    EMAIL_ID_VALUE = "12345"                                             # <-- requested fixed value
+    ENDPOINT_URL  = "https://ai.templetrends.com/digest_report.php" # <-- change
+    EMAIL_ID_VALUE = "12345"                                              # fixed value, as requested
 
     # Timeouts (keep short so jobs can't hang workers too long)
     OPEN_TIMEOUT_SECONDS  = 3
@@ -25,19 +25,18 @@ after_initialize do
 
     # Sidekiq retry count (small, so failures don't pile up)
     JOB_RETRY_COUNT = 3
-
     # =========================
 
     def self.log(msg)
       Rails.logger.info("[#{PLUGIN_NAME}] #{msg}")
     rescue StandardError
-      # swallow absolutely everything
+      # swallow
     end
 
     def self.log_error(msg)
       Rails.logger.error("[#{PLUGIN_NAME}] #{msg}")
     rescue StandardError
-      # swallow absolutely everything
+      # swallow
     end
 
     def self.enabled?
@@ -49,42 +48,48 @@ after_initialize do
     end
   end
 
-  class ::Jobs::DigestPostback < ::Jobs::Base
-    # Use low priority queue; limited retries so we never bog down the system
-    sidekiq_options queue: "low", retry: ::DigestPostback::JOB_RETRY_COUNT
+  class ::Jobs::DigestReportPostback < ::Jobs::Base
+    sidekiq_options queue: "low", retry: ::DigestReport::JOB_RETRY_COUNT
 
     def execute(args)
       begin
-        return unless ::DigestPostback.enabled?
+        return unless ::DigestReport.enabled?
 
-        url = ::DigestPostback::ENDPOINT_URL.to_s.strip
-        email_id = ::DigestPostback::EMAIL_ID_VALUE.to_s
+        url      = ::DigestReport::ENDPOINT_URL.to_s.strip
+        email_id = ::DigestReport::EMAIL_ID_VALUE.to_s
+
+        user_email = args[:user_email].to_s.strip
+        if user_email.empty?
+          ::DigestReport.log_error("Missing user_email in job args; sending anyway with blank user_email")
+        end
 
         uri =
           begin
             URI.parse(url)
           rescue StandardError => e
-            ::DigestPostback.log_error("Invalid ENDPOINT_URL #{url.inspect} err=#{e.class}: #{e.message}")
+            ::DigestReport.log_error("Invalid ENDPOINT_URL #{url.inspect} err=#{e.class}: #{e.message}")
             return
           end
 
         unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
-          ::DigestPostback.log_error("Invalid ENDPOINT_URL scheme (must be http/https): #{url.inspect}")
+          ::DigestReport.log_error("Invalid ENDPOINT_URL scheme (must be http/https): #{url.inspect}")
           return
         end
 
-        # POST body: application/x-www-form-urlencoded with only email_id=12345
-        body = URI.encode_www_form([["email_id", email_id]])
+        body = URI.encode_www_form([
+          ["email_id", email_id],
+          ["user_email", user_email]
+        ])
 
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = (uri.scheme == "https")
-        http.open_timeout = ::DigestPostback::OPEN_TIMEOUT_SECONDS
-        http.read_timeout = ::DigestPostback::READ_TIMEOUT_SECONDS
-        http.write_timeout = ::DigestPostback::WRITE_TIMEOUT_SECONDS if http.respond_to?(:write_timeout=)
+        http.open_timeout = ::DigestReport::OPEN_TIMEOUT_SECONDS
+        http.read_timeout = ::DigestReport::READ_TIMEOUT_SECONDS
+        http.write_timeout = ::DigestReport::WRITE_TIMEOUT_SECONDS if http.respond_to?(:write_timeout=)
 
         req = Net::HTTP::Post.new(uri.request_uri)
         req["Content-Type"] = "application/x-www-form-urlencoded"
-        req["User-Agent"] = "Discourse/#{Discourse::VERSION::STRING} #{::DigestPostback::PLUGIN_NAME}"
+        req["User-Agent"] = "Discourse/#{Discourse::VERSION::STRING} #{::DigestReport::PLUGIN_NAME}"
         req.body = body
 
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -95,13 +100,15 @@ after_initialize do
 
           code = res.code.to_i
           if code >= 200 && code < 300
-            ::DigestPostback.log("POST OK code=#{res.code} ms=#{ms} email_id=#{email_id}")
+            ::DigestReport.log("POST OK code=#{res.code} ms=#{ms} email_id=#{email_id} user_email_present=#{!user_email.empty?}")
           else
-            ::DigestPostback.log_error("POST FAIL code=#{res.code} ms=#{ms} email_id=#{email_id} body=#{res.body.to_s[0, 500].inspect}")
+            ::DigestReport.log_error(
+              "POST FAIL code=#{res.code} ms=#{ms} email_id=#{email_id} user_email_present=#{!user_email.empty?} body=#{res.body.to_s[0, 500].inspect}"
+            )
           end
         rescue StandardError => e
           ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
-          ::DigestPostback.log_error("POST ERROR ms=#{ms} email_id=#{email_id} err=#{e.class}: #{e.message}")
+          ::DigestReport.log_error("POST ERROR ms=#{ms} email_id=#{email_id} user_email_present=#{!user_email.empty?} err=#{e.class}: #{e.message}")
         ensure
           begin
             http.finish if http.started?
@@ -110,26 +117,27 @@ after_initialize do
           end
         end
       rescue StandardError => e
-        # Last-ditch catch: job must never explode Sidekiq worker
-        ::DigestPostback.log_error("JOB CRASH err=#{e.class}: #{e.message}")
+        ::DigestReport.log_error("JOB CRASH err=#{e.class}: #{e.message}")
       end
     end
   end
 
-  # Trigger after an email is sent; enqueue job only (never network here).
   DiscourseEvent.on(:after_email_send) do |message, email_type|
     begin
-      next unless ::DigestPostback.enabled?
+      next unless ::DigestReport.enabled?
       next unless email_type.to_s == "digest"
 
-      # Enqueue fire-and-forget
-      Jobs.enqueue(:digest_postback)
+      recipient =
+        begin
+          Array(message&.to).first.to_s.strip
+        rescue StandardError
+          ""
+        end
 
-      # Optional extra log (enqueue success)
-      ::DigestPostback.log("Enqueued digest postback job")
+      Jobs.enqueue(:digest_report_postback, user_email: recipient)
+      ::DigestReport.log("Enqueued postback user_email_present=#{!recipient.empty?}")
     rescue StandardError => e
-      # Must NEVER affect digest flow
-      ::DigestPostback.log_error("ENQUEUE ERROR err=#{e.class}: #{e.message}")
+      ::DigestReport.log_error("ENQUEUE ERROR err=#{e.class}: #{e.message}")
     end
   end
 end
