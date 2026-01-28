@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# name: digest-report-simple
+# name: digest-report
 # about: Fail-safe POST of a 20-digit email_id after each delivered digest email
 # version: 1.0
 # authors: you
