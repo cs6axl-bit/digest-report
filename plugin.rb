@@ -1,6 +1,6 @@
 # name: digest-report
-# about: POST to external endpoint after digest email is sent (failsafe, async)
-# version: 0.9
+# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel
+# version: 1.1
 # authors: you
 
 after_initialize do
@@ -18,22 +18,31 @@ after_initialize do
     # =========================
     ENABLED = true
 
-    ENDPOINT_URL = "https://ai.templetrends.com/digest_report.php" # <-- change
+    ENDPOINT_URL = "https://ai.templetrends.com/digest_report.php" # postback after send
+
+    # ===== Open tracking switch =====
+    OPEN_TRACKING_ENABLED = true
+
+    # Tracking pixel endpoint (must return an actual tiny image)
+    # Example: https://ai.templetrends.com/digest_open.php?email_id=...&user_id=...&user_email=...
+    OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
 
     # POST field names
-    EMAIL_ID_FIELD          = "email_id"            # 20-digit random
-    TOPIC_IDS_FIELD         = "topic_ids"           # CSV in EMAIL ORDER
-    TOPIC_COUNT_FIELD       = "topic_ids_count"     # integer
-    FIRST_TOPIC_ID_FIELD    = "first_topic_id"      # first topic id in email order (string)
+    EMAIL_ID_FIELD              = "email_id"            # 20-digit random
+    OPEN_TRACKING_USED_FIELD    = "open_tracking_used"  # "1" or "0"
 
-    SUBJECT_FIELD           = "subject"
-    SUBJECT_PRESENT_FLD     = "subject_present"
+    TOPIC_IDS_FIELD             = "topic_ids"           # CSV in EMAIL ORDER
+    TOPIC_COUNT_FIELD           = "topic_ids_count"     # integer
+    FIRST_TOPIC_ID_FIELD        = "first_topic_id"      # first topic id in email order (string)
 
-    FROM_EMAIL_FIELD        = "from_email"
+    SUBJECT_FIELD               = "subject"
+    SUBJECT_PRESENT_FLD         = "subject_present"
 
-    USER_ID_FIELD           = "user_id"
-    USERNAME_FIELD          = "username"
-    USER_CREATED_AT_FIELD   = "user_created_at_utc" # ISO8601
+    FROM_EMAIL_FIELD            = "from_email"
+
+    USER_ID_FIELD               = "user_id"
+    USERNAME_FIELD              = "username"
+    USER_CREATED_AT_FIELD       = "user_created_at_utc" # ISO8601
 
     # keep strings sane
     SUBJECT_MAX_LEN  = 300
@@ -48,6 +57,12 @@ after_initialize do
     # Sidekiq retry count
     JOB_RETRY_COUNT = 2
     # =========================
+
+    # PluginStore keys
+    STORE_NAMESPACE = PLUGIN_NAME
+    def self.store_key_last_email_id(user_id)
+      "last_email_id_user_#{user_id}"
+    end
 
     def self.log(msg)
       Rails.logger.info("[#{PLUGIN_NAME}] #{msg}")
@@ -64,6 +79,14 @@ after_initialize do
     def self.enabled?
       return false unless ENABLED
       return false if ENDPOINT_URL.to_s.strip.empty?
+      true
+    rescue StandardError
+      false
+    end
+
+    def self.open_tracking_enabled?
+      return false unless OPEN_TRACKING_ENABLED
+      return false if OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip.empty?
       true
     rescue StandardError
       false
@@ -95,6 +118,23 @@ after_initialize do
     rescue StandardError
       t = (Time.now.to_f * 1000).to_i.to_s
       (t + "0" * 20)[0, 20]
+    end
+
+    def self.store_last_email_id_for_user(user_id, email_id)
+      return if user_id.to_i <= 0
+      return if email_id.to_s.strip.empty?
+      PluginStore.set(STORE_NAMESPACE, store_key_last_email_id(user_id.to_i), email_id.to_s.strip)
+      true
+    rescue StandardError
+      false
+    end
+
+    def self.get_last_email_id_for_user(user_id)
+      return "" if user_id.to_i <= 0
+      v = PluginStore.get(STORE_NAMESPACE, store_key_last_email_id(user_id.to_i))
+      v.to_s.strip
+    rescue StandardError
+      ""
     end
 
     def self.extract_email_body(message)
@@ -171,8 +211,132 @@ after_initialize do
       ::DigestReport.log_error("extract_topic_ids_from_message error err=#{e.class}: #{e.message}")
       []
     end
+
+    # Build tracking pixel HTML (safe, tiny, hidden)
+    def self.build_tracking_pixel_html(email_id:, user_id:, user_email:)
+      base = OPEN_TRACKING_PIXEL_BASE_URL.to_s.strip
+      return "" if base.empty?
+
+      q = {
+        "email_id"   => email_id.to_s,
+        "user_id"    => user_id.to_s,
+        "user_email" => user_email.to_s
+      }
+
+      url =
+        begin
+          uri = URI.parse(base)
+          existing = uri.query.to_s
+          add = URI.encode_www_form(q)
+          uri.query = existing.empty? ? add : "#{existing}&#{add}"
+          uri.to_s
+        rescue StandardError
+          "#{base}?#{URI.encode_www_form(q)}"
+        end
+
+      %Q(<img src="#{CGI.escapeHTML(url)}" width="1" height="1" style="display:none!important;max-height:0;overflow:hidden" alt="" />)
+    rescue StandardError
+      ""
+    end
   end
 
+  # =========================
+  # Inject tracking pixel BEFORE send (digest only)
+  # =========================
+  module ::DigestReportEmailBuilderPatch
+    def html_part
+      part = super
+      begin
+        return part unless ::DigestReport.enabled?
+        return part unless ::DigestReport.open_tracking_enabled?
+
+        # Only digests
+        typ = ""
+        begin
+          typ = (@opts && @opts[:type]).to_s
+        rescue StandardError
+          typ = ""
+        end
+        return part unless typ == "digest"
+
+        # Identify recipient + user
+        user_email = ""
+        begin
+          user_email = @to.to_s.strip
+        rescue StandardError
+          user_email = ""
+        end
+
+        user = nil
+        begin
+          user = @opts[:user] if @opts.is_a?(Hash)
+        rescue StandardError
+          user = nil
+        end
+        if user.nil?
+          begin
+            uid = (@opts && @opts[:user_id]).to_i
+            user = User.find_by(id: uid) if uid > 0
+          rescue StandardError
+            user = nil
+          end
+        end
+        return part if user.nil? # can't store / can't do per-user
+
+        # Generate email_id ONCE per message build
+        @digest_report_email_id ||= ::DigestReport.random_20_digit_id
+
+        # Store last email_id per user (server-side "bubble")
+        ::DigestReport.store_last_email_id_for_user(user.id, @digest_report_email_id)
+
+        # Only if HTML exists
+        html = ""
+        begin
+          html = part&.body&.decoded.to_s
+        rescue StandardError
+          html = ""
+        end
+        return part if html.to_s.empty?
+
+        pixel = ::DigestReport.build_tracking_pixel_html(
+          email_id: @digest_report_email_id,
+          user_id: user.id,
+          user_email: user_email
+        )
+        return part if pixel.to_s.empty?
+
+        # Inject before </body> if present, else append
+        new_html =
+          if html.include?("</body>")
+            html.sub("</body>", "#{pixel}</body>")
+          else
+            html + pixel
+          end
+
+        begin
+          part.body = new_html
+        rescue StandardError
+          return part
+        end
+
+        ::DigestReport.log("OpenTracking injected email_id=#{@digest_report_email_id} user_id=#{user.id}")
+        part
+      rescue StandardError => e
+        ::DigestReport.log_error("OpenTracking inject error err=#{e.class}: #{e.message}")
+        part
+      end
+    end
+  end
+
+  begin
+    Email::MessageBuilder.prepend(::DigestReportEmailBuilderPatch)
+  rescue StandardError => e
+    ::DigestReport.log_error("Failed to prepend EmailBuilderPatch err=#{e.class}: #{e.message}")
+  end
+
+  # =========================
+  # Postback job (includes open_tracking_used flag)
+  # =========================
   class ::Jobs::DigestReportPostback < ::Jobs::Base
     sidekiq_options queue: "low", retry: ::DigestReport::JOB_RETRY_COUNT
 
@@ -184,6 +348,9 @@ after_initialize do
 
         email_id = args[:email_id].to_s.strip
         email_id = ::DigestReport.random_20_digit_id if email_id.empty?
+
+        open_tracking_used = args[:open_tracking_used].to_s.strip
+        open_tracking_used = "0" unless open_tracking_used == "1"
 
         user_email = args[:user_email].to_s.strip
         ::DigestReport.log_error("Missing user_email in job args; sending anyway with blank user_email") if user_email.empty?
@@ -225,6 +392,7 @@ after_initialize do
 
         form_kv = [
           [::DigestReport::EMAIL_ID_FIELD, email_id],
+          [::DigestReport::OPEN_TRACKING_USED_FIELD, open_tracking_used],
           ["user_email", user_email],
 
           [::DigestReport::FROM_EMAIL_FIELD, from_email],
@@ -262,13 +430,13 @@ after_initialize do
 
           code = res.code.to_i
           if code >= 200 && code < 300
-            ::DigestReport.log("POST OK code=#{res.code} ms=#{ms} email_id=#{email_id} topic_ids_count=#{topic_ids_count} first_topic_id=#{first_topic_id}")
+            ::DigestReport.log("POST OK code=#{res.code} ms=#{ms} email_id=#{email_id} open_tracking_used=#{open_tracking_used} topic_ids_count=#{topic_ids_count} first_topic_id=#{first_topic_id}")
           else
-            ::DigestReport.log_error("POST FAIL code=#{res.code} ms=#{ms} email_id=#{email_id} topic_ids_count=#{topic_ids_count} body=#{res.body.to_s[0, 500].inspect}")
+            ::DigestReport.log_error("POST FAIL code=#{res.code} ms=#{ms} email_id=#{email_id} open_tracking_used=#{open_tracking_used} topic_ids_count=#{topic_ids_count} body=#{res.body.to_s[0, 500].inspect}")
           end
         rescue StandardError => e
           ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
-          ::DigestReport.log_error("POST ERROR ms=#{ms} email_id=#{email_id} topic_ids_count=#{topic_ids_count} err=#{e.class}: #{e.message}")
+          ::DigestReport.log_error("POST ERROR ms=#{ms} email_id=#{email_id} open_tracking_used=#{open_tracking_used} topic_ids_count=#{topic_ids_count} err=#{e.class}: #{e.message}")
         ensure
           begin
             http.finish if http.started?
@@ -282,6 +450,9 @@ after_initialize do
     end
   end
 
+  # =========================
+  # After email send: enqueue postback (uses stored email_id if open-tracking path was used)
+  # =========================
   DiscourseEvent.on(:after_email_send) do |message, email_type|
     begin
       next unless ::DigestReport.enabled?
@@ -321,11 +492,24 @@ after_initialize do
 
       topic_ids = ::DigestReport.extract_topic_ids_from_message(message)
 
-      email_id = ::DigestReport.random_20_digit_id
+      # Use pre-send stored id if open tracking was actually used
+      email_id = ""
+      open_tracking_used = "0"
+
+      if ::DigestReport.open_tracking_enabled? && user
+        stored = ::DigestReport.get_last_email_id_for_user(user.id)
+        if !stored.to_s.strip.empty?
+          email_id = stored
+          open_tracking_used = "1"
+        end
+      end
+
+      email_id = ::DigestReport.random_20_digit_id if email_id.to_s.strip.empty?
 
       Jobs.enqueue(
         :digest_report_postback,
         email_id: email_id,
+        open_tracking_used: open_tracking_used,
         user_email: recipient,
         from_email: from_email,
         user_id: user_id,
@@ -336,7 +520,7 @@ after_initialize do
       )
 
       first_topic_id = topic_ids[0] ? topic_ids[0].to_s : ""
-      ::DigestReport.log("Enqueued postback email_id=#{email_id} user_found=#{!user.nil?} topic_ids_count=#{topic_ids.length} first_topic_id=#{first_topic_id}")
+      ::DigestReport.log("Enqueued postback email_id=#{email_id} open_tracking_used=#{open_tracking_used} user_found=#{!user.nil?} topic_ids_count=#{topic_ids.length} first_topic_id=#{first_topic_id}")
     rescue StandardError => e
       ::DigestReport.log_error("ENQUEUE ERROR err=#{e.class}: #{e.message}")
     end
