@@ -1,6 +1,6 @@
 # name: digest-report
-# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel
-# version: 1.2
+# about: POST to external endpoint after digest email is sent (failsafe, async) + optional open tracking pixel + debug logs
+# version: 1.3
 # authors: you
 
 after_initialize do
@@ -26,6 +26,10 @@ after_initialize do
     # Tracking pixel endpoint (must return an actual tiny image)
     # Example: https://ai.templetrends.com/digest_open.php?email_id=...&user_id=...&user_email=...
     OPEN_TRACKING_PIXEL_BASE_URL = "https://ai.templetrends.com/digest_open.php"
+
+    # ===== DEBUG LOGGING =====
+    # When true: writes lots of "DEBUG ..." lines to Rails logs to show WHY injection did/didn't happen
+    DEBUG_LOG = true
 
     # POST field names
     EMAIL_ID_FIELD              = "email_id"            # 20-digit random
@@ -72,6 +76,20 @@ after_initialize do
 
     def self.log_error(msg)
       Rails.logger.error("[#{PLUGIN_NAME}] #{msg}")
+    rescue StandardError
+      # swallow
+    end
+
+    def self.dlog(msg)
+      return unless DEBUG_LOG
+      log("DEBUG #{msg}")
+    rescue StandardError
+      # swallow
+    end
+
+    def self.dlog_error(msg)
+      return unless DEBUG_LOG
+      log_error("DEBUG #{msg}")
     rescue StandardError
       # swallow
     end
@@ -256,43 +274,39 @@ after_initialize do
       end
     end
 
+    def self.header_val(message, key)
+      begin
+        v = message&.header&.[](key)
+        return v.to_s.strip
+      rescue StandardError
+        ""
+      end
+    end
+
     # Inject tracking pixel into a Mail::Message (multipart or not).
     # Returns true if injection succeeded.
     def self.inject_pixel_into_mail!(mail_message, email_id:, user_id:, user_email:)
       return false if mail_message.nil?
 
       pixel = build_tracking_pixel_html(email_id: email_id, user_id: user_id, user_email: user_email)
-      return false if pixel.to_s.empty?
+      if pixel.to_s.empty?
+        dlog("inject: pixel html empty -> fail")
+        return false
+      end
 
-      # multipart -> html_part
       begin
         if mail_message.respond_to?(:multipart?) && mail_message.multipart?
           hp = mail_message.html_part rescue nil
-          if hp && hp.body
-            html = hp.body.decoded.to_s rescue ""
-            return false if html.to_s.empty?
-
-            new_html =
-              if html.include?("</body>")
-                html.sub("</body>", "#{pixel}</body>")
-              else
-                html + pixel
-              end
-
-            hp.body = new_html rescue nil
-            return true
+          if hp.nil?
+            dlog("inject: multipart but html_part=nil -> fail")
+            return false
           end
-        end
-      rescue StandardError
-        # continue to non-multipart attempt
-      end
 
-      # non-multipart HTML
-      begin
-        ct = mail_message.content_type.to_s rescue ""
-        if ct.downcase.include?("text/html")
-          html = mail_message.body.decoded.to_s rescue ""
-          return false if html.to_s.empty?
+          html = (hp.body.decoded.to_s rescue "")
+          if html.to_s.empty?
+            dlog("inject: html_part body empty -> fail")
+            return false
+          end
 
           new_html =
             if html.include?("</body>")
@@ -301,14 +315,44 @@ after_initialize do
               html + pixel
             end
 
-          mail_message.body = new_html rescue nil
+          hp.body = new_html rescue nil
+          dlog("inject: OK via html_part (len=#{html.length})")
           return true
         end
-      rescue StandardError
+      rescue StandardError => e
+        dlog_error("inject: multipart path error err=#{e.class}: #{e.message}")
+      end
+
+      begin
+        ct = (mail_message.content_type.to_s rescue "")
+        unless ct.downcase.include?("text/html")
+          dlog("inject: not multipart and content_type not html ct=#{ct.inspect} -> fail")
+          return false
+        end
+
+        html = (mail_message.body.decoded.to_s rescue "")
+        if html.to_s.empty?
+          dlog("inject: non-multipart html body empty -> fail")
+          return false
+        end
+
+        new_html =
+          if html.include?("</body>")
+            html.sub("</body>", "#{pixel}</body>")
+          else
+            html + pixel
+          end
+
+        mail_message.body = new_html rescue nil
+        dlog("inject: OK via body (len=#{html.length})")
+        return true
+      rescue StandardError => e
+        dlog_error("inject: non-multipart path error err=#{e.class}: #{e.message}")
       end
 
       false
-    rescue StandardError
+    rescue StandardError => e
+      dlog_error("inject: crash err=#{e.class}: #{e.message}")
       false
     end
 
@@ -333,7 +377,10 @@ after_initialize do
       msg = super
 
       begin
-        return msg unless ::DigestReport.enabled?
+        unless ::DigestReport.enabled?
+          ::DigestReport.dlog("build: disabled -> return")
+          return msg
+        end
 
         typ = ""
         begin
@@ -341,7 +388,11 @@ after_initialize do
         rescue StandardError
           typ = ""
         end
-        return msg unless typ == "digest"
+
+        if typ != "digest"
+          ::DigestReport.dlog("build: not digest typ=#{typ.inspect} -> return")
+          return msg
+        end
 
         # Identify user
         user = nil
@@ -358,7 +409,11 @@ after_initialize do
             user = nil
           end
         end
-        return msg if user.nil?
+
+        if user.nil?
+          ::DigestReport.dlog("build: digest but user=nil -> return")
+          return msg
+        end
 
         # Recipient email (best-effort) from builder
         user_email = ""
@@ -382,6 +437,8 @@ after_initialize do
             user_id: user.id,
             user_email: user_email
           )
+        else
+          ::DigestReport.dlog("build: open_tracking_enabled?=false")
         end
 
         open_tracking_used = injected ? "1" : "0"
@@ -392,13 +449,12 @@ after_initialize do
           user_id: user.id
         )
 
-        if injected
-          ::DigestReport.log("OpenTracking injected+stamped email_id=#{email_id} user_id=#{user.id}")
-        else
-          ::DigestReport.log("OpenTracking NOT injected (still stamped) email_id=#{email_id} user_id=#{user.id}")
-        end
+        ::DigestReport.dlog(
+          "build: typ=digest user_id=#{user.id} to=#{user_email.inspect} content_type=#{(msg.content_type.to_s rescue '').inspect} " \
+          "multipart=#{(msg.multipart? rescue 'n/a')} injected=#{injected} email_id=#{email_id}"
+        )
       rescue StandardError => e
-        ::DigestReport.log_error("Build patch error err=#{e.class}: #{e.message}")
+        ::DigestReport.dlog_error("build patch error err=#{e.class}: #{e.message}")
       end
 
       msg
@@ -535,6 +591,15 @@ after_initialize do
       next unless ::DigestReport.enabled?
       next unless email_type.to_s == "digest"
 
+      ::DigestReport.dlog(
+        "after_email_send: email_type=#{email_type.inspect} to=#{Array(message&.to).first.to_s.inspect} subject=#{message&.subject.to_s[0, 80].inspect}"
+      )
+      ::DigestReport.dlog(
+        "after_email_send: hdr email_id=#{::DigestReport.header_val(message, 'X-Digest-Report-Email-Id').inspect} " \
+        "open=#{::DigestReport.header_val(message, 'X-Digest-Report-Open-Tracking-Used').inspect} " \
+        "user_id=#{::DigestReport.header_val(message, 'X-Digest-Report-User-Id').inspect}"
+      )
+
       recipient = ::DigestReport.first_recipient_email(message)
 
       subject =
@@ -569,9 +634,9 @@ after_initialize do
       open_tracking_used = "0"
 
       begin
-        h_email_id = message&.header&.[]("X-Digest-Report-Email-Id")&.to_s.to_s.strip rescue ""
-        h_open     = message&.header&.[]("X-Digest-Report-Open-Tracking-Used")&.to_s.to_s.strip rescue ""
-        h_user_id  = message&.header&.[]("X-Digest-Report-User-Id")&.to_s.to_s.strip rescue ""
+        h_email_id = ::DigestReport.header_val(message, "X-Digest-Report-Email-Id")
+        h_open     = ::DigestReport.header_val(message, "X-Digest-Report-Open-Tracking-Used")
+        h_user_id  = ::DigestReport.header_val(message, "X-Digest-Report-User-Id")
 
         email_id = h_email_id unless h_email_id.empty?
         open_tracking_used = (h_open == "1" ? "1" : "0")
@@ -619,7 +684,10 @@ after_initialize do
       )
 
       first_topic_id = topic_ids[0] ? topic_ids[0].to_s : ""
-      ::DigestReport.log("Enqueued postback email_id=#{email_id} open_tracking_used=#{open_tracking_used} user_found=#{!user.nil?} topic_ids_count=#{topic_ids.length} first_topic_id=#{first_topic_id}")
+      ::DigestReport.log(
+        "Enqueued postback email_id=#{email_id} open_tracking_used=#{open_tracking_used} user_found=#{!user.nil?} " \
+        "topic_ids_count=#{topic_ids.length} first_topic_id=#{first_topic_id}"
+      )
     rescue StandardError => e
       ::DigestReport.log_error("ENQUEUE ERROR err=#{e.class}: #{e.message}")
     end
