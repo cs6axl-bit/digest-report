@@ -1,6 +1,6 @@
 # name: digest-report
 # about: POST to external endpoint after digest email is sent (failsafe, async)
-# version: 0.8
+# version: 0.9
 # authors: you
 
 after_initialize do
@@ -21,30 +21,31 @@ after_initialize do
     ENDPOINT_URL = "https://ai.templetrends.com/digest_report.php" # <-- change
 
     # POST field names
-    EMAIL_ID_FIELD         = "email_id"            # 20-digit random
-    TOPIC_IDS_FIELD         = "topic_ids"          # CSV in EMAIL ORDER: "12,45,99"
-    TOPIC_COUNT_FIELD       = "topic_ids_count"    # integer
+    EMAIL_ID_FIELD          = "email_id"            # 20-digit random
+    TOPIC_IDS_FIELD         = "topic_ids"           # CSV in EMAIL ORDER
+    TOPIC_COUNT_FIELD       = "topic_ids_count"     # integer
+    FIRST_TOPIC_ID_FIELD    = "first_topic_id"      # first topic id in email order (string)
 
-    SUBJECT_FIELD           = "subject"            # string
-    SUBJECT_PRESENT_FLD     = "subject_present"    # "1"/"0"
+    SUBJECT_FIELD           = "subject"
+    SUBJECT_PRESENT_FLD     = "subject_present"
 
-    FROM_EMAIL_FIELD        = "from_email"         # string
+    FROM_EMAIL_FIELD        = "from_email"
 
-    USER_ID_FIELD           = "user_id"            # integer/string
-    USERNAME_FIELD          = "username"           # string
-    USER_CREATED_AT_FIELD   = "user_created_at_utc"# ISO8601
+    USER_ID_FIELD           = "user_id"
+    USERNAME_FIELD          = "username"
+    USER_CREATED_AT_FIELD   = "user_created_at_utc" # ISO8601
 
     # keep strings sane
     SUBJECT_MAX_LEN  = 300
     FROM_MAX_LEN     = 200
     USERNAME_MAX_LEN = 200
 
-    # Timeouts (keep short so jobs can't hang workers too long)
+    # Timeouts
     OPEN_TIMEOUT_SECONDS  = 3
     READ_TIMEOUT_SECONDS  = 3
     WRITE_TIMEOUT_SECONDS = 3
 
-    # Sidekiq retry count (small, so failures don't pile up)
+    # Sidekiq retry count
     JOB_RETRY_COUNT = 2
     # =========================
 
@@ -69,8 +70,7 @@ after_initialize do
     end
 
     def self.safe_str(v, max_len)
-      s = v.to_s
-      s = s.strip
+      s = v.to_s.strip
       s = s[0, max_len] if s.length > max_len
       s
     rescue StandardError
@@ -88,20 +88,15 @@ after_initialize do
     end
 
     # Generate a random 20-digit numeric string.
-    # Uses SecureRandom for entropy, then maps to digits.
     def self.random_20_digit_id
-      # 10 bytes -> 20 hex chars, but we want digits only.
-      # We'll generate 20 digits directly using SecureRandom.random_number.
       digits = +""
       20.times { digits << SecureRandom.random_number(10).to_s }
       digits
     rescue StandardError
-      # fallback: time-based (still 20 digits), but should almost never happen
-      t = (Time.now.to_f * 1000).to_i.to_s # ms since epoch
+      t = (Time.now.to_f * 1000).to_i.to_s
       (t + "0" * 20)[0, 20]
     end
 
-    # Prefer HTML part, fallback to text, fallback to whole body
     def self.extract_email_body(message)
       return "" if message.nil?
 
@@ -123,13 +118,13 @@ after_initialize do
       end
 
       begin
-        return message.body&.decoded.to_s
+        message.body&.decoded.to_s
       rescue StandardError
         ""
       end
     end
 
-    # Extract unique topic IDs from URLs in the email, PRESERVING FIRST-SEEN ORDER
+    # Extract topic IDs in FIRST-SEEN ORDER in the email.
     def self.extract_topic_ids_from_message(message)
       body = extract_email_body(message)
       return [] if body.to_s.empty?
@@ -152,15 +147,9 @@ after_initialize do
 
       urls.each do |raw|
         next if raw.to_s.empty?
-
         u = raw.to_s.gsub(/[)\].,;]+$/, "")
 
-        uri =
-          begin
-            URI.parse(u)
-          rescue StandardError
-            nil
-          end
+        uri = (URI.parse(u) rescue nil)
         next if uri.nil?
 
         path = uri.path.to_s
@@ -193,34 +182,26 @@ after_initialize do
 
         url = ::DigestReport::ENDPOINT_URL.to_s.strip
 
-        # email_id is generated at enqueue-time so it's tied to this email send
         email_id = args[:email_id].to_s.strip
-        if email_id.empty?
-          email_id = ::DigestReport.random_20_digit_id
-        end
+        email_id = ::DigestReport.random_20_digit_id if email_id.empty?
 
         user_email = args[:user_email].to_s.strip
-        if user_email.empty?
-          ::DigestReport.log_error("Missing user_email in job args; sending anyway with blank user_email")
-        end
+        ::DigestReport.log_error("Missing user_email in job args; sending anyway with blank user_email") if user_email.empty?
 
-        # subject
         subject = ::DigestReport.safe_str(args[:subject], ::DigestReport::SUBJECT_MAX_LEN)
-        subject_present = (!subject.empty?) ? "1" : "0"
+        subject_present = subject.empty? ? "0" : "1"
 
-        # from
         from_email = ::DigestReport.safe_str(args[:from_email], ::DigestReport::FROM_MAX_LEN)
 
-        # user info
-        user_id   = args[:user_id].to_s
-        username  = ::DigestReport.safe_str(args[:username], ::DigestReport::USERNAME_MAX_LEN)
+        user_id  = args[:user_id].to_s
+        username = ::DigestReport.safe_str(args[:username], ::DigestReport::USERNAME_MAX_LEN)
         user_created_at_utc = args[:user_created_at_utc].to_s
 
-        # topic IDs CSV (EMAIL ORDER)
-        topic_ids = Array(args[:topic_ids]).map { |x| x.to_i }
+        # topic IDs in email order (dedupe while keeping order)
+        incoming_ids = Array(args[:topic_ids]).map { |x| x.to_i }
         seen = {}
         topic_ids_ordered = []
-        topic_ids.each do |tid|
+        incoming_ids.each do |tid|
           next if tid <= 0
           next if seen[tid]
           seen[tid] = true
@@ -229,14 +210,13 @@ after_initialize do
 
         topic_ids_csv   = topic_ids_ordered.join(",")
         topic_ids_count = topic_ids_ordered.length
+        first_topic_id  = topic_ids_ordered[0] ? topic_ids_ordered[0].to_s : ""
 
-        uri =
-          begin
-            URI.parse(url)
-          rescue StandardError => e
-            ::DigestReport.log_error("Invalid ENDPOINT_URL #{url.inspect} err=#{e.class}: #{e.message}")
-            return
-          end
+        uri = (URI.parse(url) rescue nil)
+        if uri.nil?
+          ::DigestReport.log_error("Invalid ENDPOINT_URL #{url.inspect}")
+          return
+        end
 
         unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
           ::DigestReport.log_error("Invalid ENDPOINT_URL scheme (must be http/https): #{url.inspect}")
@@ -257,7 +237,8 @@ after_initialize do
           [::DigestReport::SUBJECT_PRESENT_FLD, subject_present],
 
           [::DigestReport::TOPIC_IDS_FIELD, topic_ids_csv],
-          [::DigestReport::TOPIC_COUNT_FIELD, topic_ids_count.to_s]
+          [::DigestReport::TOPIC_COUNT_FIELD, topic_ids_count.to_s],
+          [::DigestReport::FIRST_TOPIC_ID_FIELD, first_topic_id]
         ]
 
         body = URI.encode_www_form(form_kv)
@@ -281,19 +262,13 @@ after_initialize do
 
           code = res.code.to_i
           if code >= 200 && code < 300
-            ::DigestReport.log(
-              "POST OK code=#{res.code} ms=#{ms} email_id=#{email_id} user_email_present=#{!user_email.empty?} subject_present=#{subject_present} topic_ids_count=#{topic_ids_count} user_id_present=#{!user_id.empty?}"
-            )
+            ::DigestReport.log("POST OK code=#{res.code} ms=#{ms} email_id=#{email_id} topic_ids_count=#{topic_ids_count} first_topic_id=#{first_topic_id}")
           else
-            ::DigestReport.log_error(
-              "POST FAIL code=#{res.code} ms=#{ms} email_id=#{email_id} user_email_present=#{!user_email.empty?} topic_ids_count=#{topic_ids_count} body=#{res.body.to_s[0, 500].inspect}"
-            )
+            ::DigestReport.log_error("POST FAIL code=#{res.code} ms=#{ms} email_id=#{email_id} topic_ids_count=#{topic_ids_count} body=#{res.body.to_s[0, 500].inspect}")
           end
         rescue StandardError => e
           ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
-          ::DigestReport.log_error(
-            "POST ERROR ms=#{ms} email_id=#{email_id} user_email_present=#{!user_email.empty?} topic_ids_count=#{topic_ids_count} err=#{e.class}: #{e.message}"
-          )
+          ::DigestReport.log_error("POST ERROR ms=#{ms} email_id=#{email_id} topic_ids_count=#{topic_ids_count} err=#{e.class}: #{e.message}")
         ensure
           begin
             http.finish if http.started?
@@ -333,7 +308,6 @@ after_initialize do
           ""
         end
 
-      # Lookup user by recipient email
       user = nil
       begin
         user = User.find_by_email(recipient) unless recipient.empty?
@@ -345,10 +319,8 @@ after_initialize do
       username = user ? user.username.to_s : ""
       user_created_at_utc = user ? ::DigestReport.safe_iso8601(user.created_at) : ""
 
-      # Topic IDs in EMAIL ORDER
       topic_ids = ::DigestReport.extract_topic_ids_from_message(message)
 
-      # Generate a per-email 20-digit id at enqueue-time
       email_id = ::DigestReport.random_20_digit_id
 
       Jobs.enqueue(
@@ -363,9 +335,8 @@ after_initialize do
         topic_ids: topic_ids
       )
 
-      ::DigestReport.log(
-        "Enqueued postback email_id=#{email_id} user_email_present=#{!recipient.empty?} from_present=#{!from_email.empty?} user_found=#{!user.nil?} topic_ids_count=#{topic_ids.length}"
-      )
+      first_topic_id = topic_ids[0] ? topic_ids[0].to_s : ""
+      ::DigestReport.log("Enqueued postback email_id=#{email_id} user_found=#{!user.nil?} topic_ids_count=#{topic_ids.length} first_topic_id=#{first_topic_id}")
     rescue StandardError => e
       ::DigestReport.log_error("ENQUEUE ERROR err=#{e.class}: #{e.message}")
     end
